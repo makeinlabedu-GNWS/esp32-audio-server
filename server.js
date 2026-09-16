@@ -23,7 +23,6 @@ wss.on('connection', (ws, req) => {
   if (role === 'esp32') {
     esp32Socket = ws;
     console.log("ESP32 Connected");
-    // Broadcast ESP32 status to all connected phones
     wss.clients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'status', espConnected: true }));
@@ -40,15 +39,9 @@ wss.on('connection', (ws, req) => {
       });
     });
   } else if (role === 'phone') {
-    // Send initial status to phone
     ws.send(JSON.stringify({ type: 'status', espConnected: esp32Socket !== null }));
-
-    ws.on('message', (msg) => {
-      // Handles client messages if any
-    });
   }
 
-  // Relay binary audio data from ESP32 to Phone
   ws.on('message', (data, isBinary) => {
     if (role === 'esp32' && isBinary) {
       wss.clients.forEach(client => {
@@ -71,7 +64,7 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Secure High-Gain Receiver</title>
+      <title>Real-Time Secure Audio</title>
       <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; padding-top: 30px; }
         .card { background: #1e1e1e; margin: 0 auto; max-width: 350px; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
@@ -83,19 +76,20 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="card">
-        <h2>🔒 Live Monitor</h2>
+        <h2>🔒 Live Audio Monitor</h2>
         <div class="status-box">ESP32 Status: <span id="espStatus" class="offline">Checking...</span></div>
-        <div class="status-box">Audio Stream: <span id="streamStatus">Stopped</span></div>
+        <div class="status-box">Stream: <span id="streamStatus">Stopped</span></div>
         <button class="btn" onclick="startStream()">▶ START AUDIO</button>
       </div>
 
       <script>
         let audioCtx = null;
         let nextTime = 0;
-        const GAIN_BOOST = 3.5; // 3.5x Sound Boost (High Volume)
+        const GAIN_BOOST = 4.0; // Loud volume multiplier
 
         function startStream() {
           if (!audioCtx) {
+            // Force exact 16000Hz matching with ESP32 to fix slow pitch / deep voice issue
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
           }
           if (audioCtx.state === 'suspended') {
@@ -120,23 +114,23 @@ app.get('/', (req, res) => {
                     statusEl.innerText = "ONLINE 🟢";
                     statusEl.className = "online";
                   } else {
-                    statusEl.innerText = "OFFLINE 🔴 (Wi-Fi/Power Off)";
+                    statusEl.innerText = "OFFLINE 🔴";
                     statusEl.className = "offline";
                   }
                 }
               } catch(e){}
             } else if (event.data instanceof ArrayBuffer) {
-              playPCM(event.data);
+              playPCMInstant(event.data);
             }
           };
 
           ws.onclose = () => { 
             document.getElementById('streamStatus').innerText = "Disconnected 🔴"; 
-            document.getElementById('espStatus').innerText = "Unknown";
+            document.getElementById('espStatus').innerText = "Offline";
           };
         }
 
-        function playPCM(arrayBuffer) {
+        function playPCMInstant(arrayBuffer) {
           if (!audioCtx) return;
           const pcm16 = new Int16Array(arrayBuffer);
           if (pcm16.length === 0) return;
@@ -145,7 +139,6 @@ app.get('/', (req, res) => {
           const channelData = buffer.getChannelData(0);
           
           for (let i = 0; i < pcm16.length; i++) {
-            // Apply High Gain Multiplier & Clipping Protection
             let sample = (pcm16[i] / 32768.0) * GAIN_BOOST;
             if (sample > 1.0) sample = 1.0;
             if (sample < -1.0) sample = -1.0;
@@ -156,9 +149,12 @@ app.get('/', (req, res) => {
           source.buffer = buffer;
           source.connect(audioCtx.destination);
 
-          if (nextTime < audioCtx.currentTime) {
-            nextTime = audioCtx.currentTime + 0.04;
+          // Zero-delay optimization: Play instantly without queue buildup
+          let currentTime = audioCtx.currentTime;
+          if (nextTime < currentTime) {
+            nextTime = currentTime;
           }
+          
           source.start(nextTime);
           nextTime += buffer.duration;
         }

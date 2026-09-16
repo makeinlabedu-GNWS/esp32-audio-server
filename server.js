@@ -10,6 +10,21 @@ const SECRET_KEY = "Prakash1234";
 let esp32Socket = null;
 let isAudioActive = false;
 
+function broadcastState() {
+  const isEspOnline = (esp32Socket !== null && esp32Socket.readyState === WebSocket.OPEN);
+  const payload = JSON.stringify({
+    type: 'system_state',
+    espOnline: isEspOnline,
+    audioActive: isAudioActive
+  });
+
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client !== esp32Socket) {
+      client.send(payload);
+    }
+  });
+}
+
 wss.on('connection', (ws, req) => {
   const urlParams = new URLSearchParams(req.url.replace('/?', ''));
   const key = urlParams.get('key');
@@ -23,28 +38,30 @@ wss.on('connection', (ws, req) => {
 
   if (role === 'esp32') {
     esp32Socket = ws;
-    // Notify all connected phones that ESP32 is ONLINE
-    wss.clients.forEach(client => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ type: 'esp_status', online: true }));
+    broadcastState();
+
+    ws.on('close', () => {
+      if (esp32Socket === ws) {
+        esp32Socket = null;
+        isAudioActive = false;
+        broadcastState();
       }
     });
 
-    ws.on('close', () => {
-      esp32Socket = null;
-      isAudioActive = false;
-      wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'esp_status', online: false }));
-        }
-      });
+    ws.on('error', () => {
+      if (esp32Socket === ws) {
+        esp32Socket = null;
+        isAudioActive = false;
+        broadcastState();
+      }
     });
   } else if (role === 'phone') {
-    // Send immediate initial state
-    ws.send(JSON.stringify({ 
-      type: 'init_status', 
-      espOnline: (esp32Socket !== null && esp32Socket.readyState === WebSocket.OPEN),
-      audioActive: isAudioActive 
+    // Send immediate status on connect
+    const isEspOnline = (esp32Socket !== null && esp32Socket.readyState === WebSocket.OPEN);
+    ws.send(JSON.stringify({
+      type: 'system_state',
+      espOnline: isEspOnline,
+      audioActive: isAudioActive
     }));
 
     ws.on('message', (msg) => {
@@ -62,18 +79,13 @@ wss.on('connection', (ws, req) => {
               esp32Socket.send(JSON.stringify({ type: 'stream_cmd', state: 'stop' }));
             }
           }
-          // Broadcast state to sync UI across all clients
-          wss.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({ type: 'audio_status', active: isAudioActive }));
-            }
-          });
+          broadcastState();
         }
       } catch(e) {}
     });
   }
 
-  // Audio Data Relay
+  // Forward audio stream safely
   ws.on('message', (data, isBinary) => {
     if (role === 'esp32' && isBinary) {
       wss.clients.forEach(client => {
@@ -96,11 +108,11 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>ESP32 Audio Controller</title>
+      <title>Audio HUD Controller</title>
       <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; padding-top: 20px; }
         .card { background: #1e1e1e; margin: 0 auto; max-width: 360px; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-        .btn { padding: 16px 32px; font-size: 18px; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 20px; width: 90%; transition: 0.2s; }
+        .btn { padding: 16px 32px; font-size: 18px; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 20px; width: 90%; }
         .btn-start { background: #00ff88; color: #000; }
         .btn-stop { background: #ff4444; color: #fff; }
         .status-box { font-size: 15px; margin: 10px 0; padding: 12px; border-radius: 8px; background: #2a2a2a; text-align: left; }
@@ -110,10 +122,10 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="card">
-        <h2>🔒 Live Audio HUD</h2>
-        <div class="status-box">Server Link: <span id="serverStatus" class="offline">Connecting...</span></div>
-        <div class="status-box">ESP32 Status: <span id="espStatus" class="offline">Checking...</span></div>
-        <div class="status-box">Audio Stream: <span id="streamStatus">Stopped 🔴</span></div>
+        <h2>🔒 Audio Dashboard</h2>
+        <div class="status-box">Cloud Server: <span id="serverStatus" class="offline">Connecting...</span></div>
+        <div class="status-box">ESP32 Device: <span id="espStatus" class="offline">OFFLINE 🔴</span></div>
+        <div class="status-box">Audio State: <span id="streamStatus">Stopped 🔴</span></div>
         <button id="toggleBtn" class="btn btn-start" onclick="toggleAudio()">▶ START AUDIO</button>
       </div>
 
@@ -124,7 +136,7 @@ app.get('/', (req, res) => {
         let nextTime = 0;
         const GAIN_BOOST = 2.5;
 
-        function connectWebSocket() {
+        function connectWS() {
           const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
           ws = new WebSocket(protocol + location.host + '/?role=phone&key=${SECRET_KEY}');
           ws.binaryType = 'arraybuffer';
@@ -138,13 +150,8 @@ app.get('/', (req, res) => {
             if (typeof event.data === 'string') {
               try {
                 const data = JSON.parse(event.data);
-                if (data.type === 'init_status') {
-                  updateEspUI(data.espOnline);
-                  setAudioUI(data.audioActive);
-                } else if (data.type === 'esp_status') {
-                  updateEspUI(data.online);
-                } else if (data.type === 'audio_status') {
-                  setAudioUI(data.active);
+                if (data.type === 'system_state') {
+                  updateUI(data.espOnline, data.audioActive);
                 }
               } catch(e){}
             } else if (event.data instanceof ArrayBuffer && isPlaying) {
@@ -155,29 +162,26 @@ app.get('/', (req, res) => {
           ws.onclose = () => {
             document.getElementById('serverStatus').innerText = "DISCONNECTED 🔴";
             document.getElementById('serverStatus').className = "offline";
-            updateEspUI(false);
-            setAudioUI(false);
-            setTimeout(connectWebSocket, 2000);
+            updateUI(false, false);
+            setTimeout(connectWS, 2000);
           };
         }
 
-        function updateEspUI(online) {
-          const el = document.getElementById('espStatus');
-          if (online) {
-            el.innerText = "ONLINE 🟢";
-            el.className = "online";
+        function updateUI(espOnline, audioActive) {
+          const espEl = document.getElementById('espStatus');
+          if (espOnline) {
+            espEl.innerText = "ONLINE 🟢";
+            espEl.className = "online";
           } else {
-            el.innerText = "OFFLINE 🔴";
-            el.className = "offline";
+            espEl.innerText = "OFFLINE 🔴";
+            espEl.className = "offline";
           }
-        }
 
-        function setAudioUI(active) {
-          isPlaying = active;
+          isPlaying = audioActive;
           const btn = document.getElementById('toggleBtn');
           const streamEl = document.getElementById('streamStatus');
-          
-          if (active) {
+
+          if (audioActive) {
             streamEl.innerText = "STREAMING LIVE 🟢";
             btn.innerText = "⏹ STOP AUDIO";
             btn.className = "btn btn-stop";
@@ -190,7 +194,6 @@ app.get('/', (req, res) => {
 
         function toggleAudio() {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
           if (!isPlaying) {
             if (!audioCtx) {
               audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
@@ -211,7 +214,7 @@ app.get('/', (req, res) => {
 
           const buffer = audioCtx.createBuffer(1, pcm16.length, 16000);
           const channelData = buffer.getChannelData(0);
-          
+
           for (let i = 0; i < pcm16.length; i++) {
             let sample = (pcm16[i] / 32768.0) * GAIN_BOOST;
             if (sample > 1.0) sample = 1.0;
@@ -232,7 +235,7 @@ app.get('/', (req, res) => {
           nextTime += buffer.duration;
         }
 
-        connectWebSocket();
+        connectWS();
       </script>
     </body>
     </html>

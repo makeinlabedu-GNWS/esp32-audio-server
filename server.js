@@ -6,7 +6,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const SECRET_KEY = "Prakash1234"; // AAPKA PASSCODE
+const SECRET_KEY = "Prakash1234";
 let esp32Socket = null;
 
 wss.on('connection', (ws, req) => {
@@ -22,7 +22,6 @@ wss.on('connection', (ws, req) => {
 
   if (role === 'esp32') {
     esp32Socket = ws;
-    console.log("ESP32 Connected");
     wss.clients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'status', espConnected: true }));
@@ -31,7 +30,6 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
       esp32Socket = null;
-      console.log("ESP32 Disconnected");
       wss.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: 'status', espConnected: false }));
@@ -64,7 +62,7 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Real-Time Secure Audio</title>
+      <title>Low-Latency Realtime Audio</title>
       <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; padding-top: 30px; }
         .card { background: #1e1e1e; margin: 0 auto; max-width: 350px; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
@@ -76,7 +74,7 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="card">
-        <h2>🔒 Live Audio Monitor</h2>
+        <h2>🔒 Live Audio</h2>
         <div class="status-box">ESP32 Status: <span id="espStatus" class="offline">Checking...</span></div>
         <div class="status-box">Stream: <span id="streamStatus">Stopped</span></div>
         <button class="btn" onclick="startStream()">▶ START AUDIO</button>
@@ -85,11 +83,10 @@ app.get('/', (req, res) => {
       <script>
         let audioCtx = null;
         let nextTime = 0;
-        const GAIN_BOOST = 4.0; // Loud volume multiplier
+        const GAIN_BOOST = 2.5;
 
         function startStream() {
           if (!audioCtx) {
-            // Force exact 16000Hz matching with ESP32 to fix slow pitch / deep voice issue
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
           }
           if (audioCtx.state === 'suspended') {
@@ -120,17 +117,16 @@ app.get('/', (req, res) => {
                 }
               } catch(e){}
             } else if (event.data instanceof ArrayBuffer) {
-              playPCMInstant(event.data);
+              playPCM(event.data);
             }
           };
 
           ws.onclose = () => { 
             document.getElementById('streamStatus').innerText = "Disconnected 🔴"; 
-            document.getElementById('espStatus').innerText = "Offline";
           };
         }
 
-        function playPCMInstant(arrayBuffer) {
+        function playPCM(arrayBuffer) {
           if (!audioCtx) return;
           const pcm16 = new Int16Array(arrayBuffer);
           if (pcm16.length === 0) return;
@@ -149,12 +145,13 @@ app.get('/', (req, res) => {
           source.buffer = buffer;
           source.connect(audioCtx.destination);
 
-          // Zero-delay optimization: Play instantly without queue buildup
           let currentTime = audioCtx.currentTime;
-          if (nextTime < currentTime) {
+          
+          // LATENCY FIX: Drop old queue if delay exceeds 0.25 seconds
+          if (nextTime < currentTime || (nextTime - currentTime) > 0.25) {
             nextTime = currentTime;
           }
-          
+
           source.start(nextTime);
           nextTime += buffer.duration;
         }

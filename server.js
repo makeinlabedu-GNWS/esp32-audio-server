@@ -6,7 +6,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const SECRET_KEY = "Prakash1234";
+const SECRET_KEY = "Prakash360";
 let esp32Socket = null;
 let isAudioActive = false;
 

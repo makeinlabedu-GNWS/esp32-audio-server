@@ -22,16 +22,42 @@ wss.on('connection', (ws, req) => {
 
   if (role === 'esp32') {
     esp32Socket = ws;
-    ws.on('close', () => { esp32Socket = null; });
+    console.log("ESP32 Connected");
+    // Broadcast ESP32 status to all connected phones
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'status', espConnected: true }));
+      }
+    });
+
+    ws.on('close', () => {
+      esp32Socket = null;
+      console.log("ESP32 Disconnected");
+      wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: 'status', espConnected: false }));
+        }
+      });
+    });
   } else if (role === 'phone') {
-    if (esp32Socket) {
-      esp32Socket.on('message', (data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
+    // Send initial status to phone
+    ws.send(JSON.stringify({ type: 'status', espConnected: esp32Socket !== null }));
+
+    ws.on('message', (msg) => {
+      // Handles client messages if any
+    });
+  }
+
+  // Relay binary audio data from ESP32 to Phone
+  ws.on('message', (data, isBinary) => {
+    if (role === 'esp32' && isBinary) {
+      wss.clients.forEach(client => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          client.send(data, { binary: true });
         }
       });
     }
-  }
+  });
 });
 
 app.get('/', (req, res) => {
@@ -45,39 +71,94 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Secure Receiver</title>
+      <title>Secure High-Gain Receiver</title>
       <style>
-        body { font-family: Arial; text-align: center; background: #121212; color: #fff; padding-top: 50px; }
-        .btn { padding: 15px 30px; font-size: 18px; background: #00ff88; color: #000; border: none; border-radius: 25px; cursor: pointer; }
+        body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; padding-top: 30px; }
+        .card { background: #1e1e1e; margin: 0 auto; max-width: 350px; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .btn { padding: 16px 32px; font-size: 18px; background: #00ff88; color: #000; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 15px; }
+        .status-box { font-size: 16px; margin: 10px 0; padding: 10px; border-radius: 8px; background: #2a2a2a; }
+        .online { color: #00ff88; font-weight: bold; }
+        .offline { color: #ff4444; font-weight: bold; }
       </style>
     </head>
     <body>
-      <h2>🔒 Secure Live Audio</h2>
-      <p id="status">Status: Ready</p>
-      <button class="btn" onclick="startStream()">LISTEN LIVE</button>
+      <div class="card">
+        <h2>🔒 Live Monitor</h2>
+        <div class="status-box">ESP32 Status: <span id="espStatus" class="offline">Checking...</span></div>
+        <div class="status-box">Audio Stream: <span id="streamStatus">Stopped</span></div>
+        <button class="btn" onclick="startStream()">▶ START AUDIO</button>
+      </div>
+
       <script>
-        let audioCtx, nextTime = 0;
+        let audioCtx = null;
+        let nextTime = 0;
+        const GAIN_BOOST = 3.5; // 3.5x Sound Boost (High Volume)
+
         function startStream() {
-          document.getElementById('status').innerText = "Connecting...";
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          }
+          if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+          }
+
+          document.getElementById('streamStatus').innerText = "Connecting...";
           const ws = new WebSocket('wss://' + location.host + '/?role=phone&key=${SECRET_KEY}');
           ws.binaryType = 'arraybuffer';
-          ws.onopen = () => { document.getElementById('status').innerText = "Streaming Live 🟢"; };
+
+          ws.onopen = () => { 
+            document.getElementById('streamStatus').innerText = "Streaming Live 🟢"; 
+          };
+
           ws.onmessage = (event) => {
-            if (event.data instanceof ArrayBuffer) {
-              playPCM(new Int16Array(event.data));
+            if (typeof event.data === 'string') {
+              try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'status') {
+                  const statusEl = document.getElementById('espStatus');
+                  if (data.espConnected) {
+                    statusEl.innerText = "ONLINE 🟢";
+                    statusEl.className = "online";
+                  } else {
+                    statusEl.innerText = "OFFLINE 🔴 (Wi-Fi/Power Off)";
+                    statusEl.className = "offline";
+                  }
+                }
+              } catch(e){}
+            } else if (event.data instanceof ArrayBuffer) {
+              playPCM(event.data);
             }
           };
-          ws.onclose = () => { document.getElementById('status').innerText = "Disconnected 🔴"; };
+
+          ws.onclose = () => { 
+            document.getElementById('streamStatus').innerText = "Disconnected 🔴"; 
+            document.getElementById('espStatus').innerText = "Unknown";
+          };
         }
-        function playPCM(pcmData) {
-          const buffer = audioCtx.createBuffer(1, pcmData.length, 16000);
+
+        function playPCM(arrayBuffer) {
+          if (!audioCtx) return;
+          const pcm16 = new Int16Array(arrayBuffer);
+          if (pcm16.length === 0) return;
+
+          const buffer = audioCtx.createBuffer(1, pcm16.length, 16000);
           const channelData = buffer.getChannelData(0);
-          for (let i = 0; i < pcmData.length; i++) channelData[i] = pcmData[i] / 32768.0;
+          
+          for (let i = 0; i < pcm16.length; i++) {
+            // Apply High Gain Multiplier & Clipping Protection
+            let sample = (pcm16[i] / 32768.0) * GAIN_BOOST;
+            if (sample > 1.0) sample = 1.0;
+            if (sample < -1.0) sample = -1.0;
+            channelData[i] = sample;
+          }
+
           const source = audioCtx.createBufferSource();
           source.buffer = buffer;
           source.connect(audioCtx.destination);
-          if (nextTime < audioCtx.currentTime) nextTime = audioCtx.currentTime;
+
+          if (nextTime < audioCtx.currentTime) {
+            nextTime = audioCtx.currentTime + 0.04;
+          }
           source.start(nextTime);
           nextTime += buffer.duration;
         }

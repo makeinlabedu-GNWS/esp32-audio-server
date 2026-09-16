@@ -56,7 +56,6 @@ wss.on('connection', (ws, req) => {
       }
     });
   } else if (role === 'phone') {
-    // Send immediate status on connect
     const isEspOnline = (esp32Socket !== null && esp32Socket.readyState === WebSocket.OPEN);
     ws.send(JSON.stringify({
       type: 'system_state',
@@ -85,7 +84,6 @@ wss.on('connection', (ws, req) => {
     });
   }
 
-  // Forward audio stream safely
   ws.on('message', (data, isBinary) => {
     if (role === 'esp32' && isBinary) {
       wss.clients.forEach(client => {
@@ -108,25 +106,29 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Audio HUD Controller</title>
+      <title>Audio HUD Controller & Recorder</title>
       <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; padding-top: 20px; }
         .card { background: #1e1e1e; margin: 0 auto; max-width: 360px; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-        .btn { padding: 16px 32px; font-size: 18px; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 20px; width: 90%; }
+        .btn { padding: 14px 28px; font-size: 16px; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 15px; width: 90%; transition: 0.2s; }
         .btn-start { background: #00ff88; color: #000; }
         .btn-stop { background: #ff4444; color: #fff; }
-        .status-box { font-size: 15px; margin: 10px 0; padding: 12px; border-radius: 8px; background: #2a2a2a; text-align: left; }
+        .btn-rec { background: #ff9900; color: #000; }
+        .btn-rec-stop { background: #e60000; color: #fff; }
+        .status-box { font-size: 15px; margin: 8px 0; padding: 10px; border-radius: 8px; background: #2a2a2a; text-align: left; }
         .online { color: #00ff88; font-weight: bold; }
         .offline { color: #ff4444; font-weight: bold; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h2>🔒 Audio Dashboard</h2>
+        <h2>🔒 Audio Controller</h2>
         <div class="status-box">Cloud Server: <span id="serverStatus" class="offline">Connecting...</span></div>
         <div class="status-box">ESP32 Device: <span id="espStatus" class="offline">OFFLINE 🔴</span></div>
         <div class="status-box">Audio State: <span id="streamStatus">Stopped 🔴</span></div>
+        
         <button id="toggleBtn" class="btn btn-start" onclick="toggleAudio()">▶ START AUDIO</button>
+        <button id="recBtn" class="btn btn-rec" onclick="toggleRecording()" style="display:none;">🎙️ START RECORDING</button>
       </div>
 
       <script>
@@ -135,6 +137,11 @@ app.get('/', (req, res) => {
         let isPlaying = false;
         let nextTime = 0;
         const GAIN_BOOST = 2.5;
+
+        let mediaStreamDest = null;
+        let mediaRecorder = null;
+        let recordedChunks = [];
+        let isRecording = false;
 
         function connectWS() {
           const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
@@ -179,16 +186,20 @@ app.get('/', (req, res) => {
 
           isPlaying = audioActive;
           const btn = document.getElementById('toggleBtn');
+          const recBtn = document.getElementById('recBtn');
           const streamEl = document.getElementById('streamStatus');
 
           if (audioActive) {
             streamEl.innerText = "STREAMING LIVE 🟢";
             btn.innerText = "⏹ STOP AUDIO";
             btn.className = "btn btn-stop";
+            recBtn.style.display = "inline-block";
           } else {
             streamEl.innerText = "Stopped 🔴";
             btn.innerText = "▶ START AUDIO";
             btn.className = "btn btn-start";
+            recBtn.style.display = "none";
+            if(isRecording) stopRecording();
           }
         }
 
@@ -197,6 +208,7 @@ app.get('/', (req, res) => {
           if (!isPlaying) {
             if (!audioCtx) {
               audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+              mediaStreamDest = audioCtx.createMediaStreamDestination();
             }
             if (audioCtx.state === 'suspended') {
               audioCtx.resume();
@@ -224,7 +236,11 @@ app.get('/', (req, res) => {
 
           const source = audioCtx.createBufferSource();
           source.buffer = buffer;
+          
           source.connect(audioCtx.destination);
+          if (mediaStreamDest) {
+            source.connect(mediaStreamDest);
+          }
 
           let currentTime = audioCtx.currentTime;
           if (nextTime < currentTime || (nextTime - currentTime) > 0.2) {
@@ -233,6 +249,59 @@ app.get('/', (req, res) => {
 
           source.start(nextTime);
           nextTime += buffer.duration;
+        }
+
+        function toggleRecording() {
+          if (!isRecording) {
+            startRecording();
+          } else {
+            stopRecording();
+          }
+        }
+
+        function startRecording() {
+          if (!mediaStreamDest) return;
+          recordedChunks = [];
+          mediaRecorder = new MediaRecorder(mediaStreamDest.stream);
+
+          mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) {
+              recordedChunks.push(e.data);
+            }
+          };
+
+          mediaRecorder.onstop = saveAudioFile;
+
+          mediaRecorder.start();
+          isRecording = true;
+          const recBtn = document.getElementById('recBtn');
+          recBtn.innerText = "⏹ STOP & SAVE REC";
+          recBtn.className = "btn btn-rec-stop";
+        }
+
+        function stopRecording() {
+          if (mediaRecorder && isRecording) {
+            mediaRecorder.stop();
+            isRecording = false;
+            const recBtn = document.getElementById('recBtn');
+            recBtn.innerText = "🎙️ START RECORDING";
+            recBtn.className = "btn btn-rec";
+          }
+        }
+
+        function saveAudioFile() {
+          const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.style.display = 'none';
+          a.href = url;
+          a.download = 'ESP32_Audio_Record_' + new Date().getTime() + '.webm';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+          }, 100);
         }
 
         connectWS();

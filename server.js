@@ -8,6 +8,7 @@ const wss = new WebSocket.Server({ server });
 
 const SECRET_KEY = "Prakash1234";
 let esp32Socket = null;
+let activePhonesCount = 0;
 
 wss.on('connection', (ws, req) => {
   const urlParams = new URLSearchParams(req.url.replace('/?', ''));
@@ -22,6 +23,13 @@ wss.on('connection', (ws, req) => {
 
   if (role === 'esp32') {
     esp32Socket = ws;
+    // ESP32 ko current stream status notify karein
+    if (activePhonesCount > 0) {
+      esp32Socket.send(JSON.stringify({ type: 'stream_cmd', state: 'start' }));
+    } else {
+      esp32Socket.send(JSON.stringify({ type: 'stream_cmd', state: 'stop' }));
+    }
+
     wss.clients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'status', espConnected: true }));
@@ -38,6 +46,34 @@ wss.on('connection', (ws, req) => {
     });
   } else if (role === 'phone') {
     ws.send(JSON.stringify({ type: 'status', espConnected: esp32Socket !== null }));
+
+    ws.on('message', (msg) => {
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed.type === 'phone_action') {
+          if (parsed.action === 'start') {
+            activePhonesCount++;
+            if (activePhonesCount === 1 && esp32Socket && esp32Socket.readyState === WebSocket.OPEN) {
+              esp32Socket.send(JSON.stringify({ type: 'stream_cmd', state: 'start' }));
+            }
+          } else if (parsed.action === 'stop') {
+            if (activePhonesCount > 0) activePhonesCount--;
+            if (activePhonesCount === 0 && esp32Socket && esp32Socket.readyState === WebSocket.OPEN) {
+              esp32Socket.send(JSON.stringify({ type: 'stream_cmd', state: 'stop' }));
+            }
+          }
+        }
+      } catch(e) {}
+    });
+
+    ws.on('close', () => {
+      if (ws.isStreaming) {
+        if (activePhonesCount > 0) activePhonesCount--;
+        if (activePhonesCount === 0 && esp32Socket && esp32Socket.readyState === WebSocket.OPEN) {
+          esp32Socket.send(JSON.stringify({ type: 'stream_cmd', state: 'stop' }));
+        }
+      }
+    });
   }
 
   ws.on('message', (data, isBinary) => {
@@ -62,11 +98,13 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Low-Latency Realtime Audio</title>
+      <title>Live Audio Monitor</title>
       <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; padding-top: 30px; }
         .card { background: #1e1e1e; margin: 0 auto; max-width: 350px; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-        .btn { padding: 16px 32px; font-size: 18px; background: #00ff88; color: #000; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 15px; }
+        .btn { padding: 16px 32px; font-size: 18px; border: none; border-radius: 30px; cursor: pointer; font-weight: bold; margin-top: 15px; }
+        .btn-start { background: #00ff88; color: #000; }
+        .btn-stop { background: #ff4444; color: #fff; }
         .status-box { font-size: 16px; margin: 10px 0; padding: 10px; border-radius: 8px; background: #2a2a2a; }
         .online { color: #00ff88; font-weight: bold; }
         .offline { color: #ff4444; font-weight: bold; }
@@ -77,13 +115,23 @@ app.get('/', (req, res) => {
         <h2>🔒 Live Audio</h2>
         <div class="status-box">ESP32 Status: <span id="espStatus" class="offline">Checking...</span></div>
         <div class="status-box">Stream: <span id="streamStatus">Stopped</span></div>
-        <button class="btn" onclick="startStream()">▶ START AUDIO</button>
+        <button id="toggleBtn" class="btn btn-start" onclick="toggleStream()">▶ START AUDIO</button>
       </div>
 
       <script>
         let audioCtx = null;
+        let ws = null;
+        let isStreaming = false;
         let nextTime = 0;
         const GAIN_BOOST = 2.5;
+
+        function toggleStream() {
+          if (!isStreaming) {
+            startStream();
+          } else {
+            stopStream();
+          }
+        }
 
         function startStream() {
           if (!audioCtx) {
@@ -94,11 +142,17 @@ app.get('/', (req, res) => {
           }
 
           document.getElementById('streamStatus').innerText = "Connecting...";
-          const ws = new WebSocket('wss://' + location.host + '/?role=phone&key=${SECRET_KEY}');
+          ws = new WebSocket('wss://' + location.host + '/?role=phone&key=${SECRET_KEY}');
           ws.binaryType = 'arraybuffer';
 
           ws.onopen = () => { 
-            document.getElementById('streamStatus').innerText = "Streaming Live 🟢"; 
+            isStreaming = true;
+            ws.isStreaming = true;
+            ws.send(JSON.stringify({ type: 'phone_action', action: 'start' }));
+            document.getElementById('streamStatus').innerText = "Streaming Live 🟢";
+            const btn = document.getElementById('toggleBtn');
+            btn.innerText = "⏹ STOP AUDIO";
+            btn.className = "btn btn-stop";
           };
 
           ws.onmessage = (event) => {
@@ -116,14 +170,30 @@ app.get('/', (req, res) => {
                   }
                 }
               } catch(e){}
-            } else if (event.data instanceof ArrayBuffer) {
+            } else if (event.data instanceof ArrayBuffer && isStreaming) {
               playPCM(event.data);
             }
           };
 
           ws.onclose = () => { 
-            document.getElementById('streamStatus').innerText = "Disconnected 🔴"; 
+            stopStreamUI();
           };
+        }
+
+        function stopStream() {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'phone_action', action: 'stop' }));
+            ws.close();
+          }
+          stopStreamUI();
+        }
+
+        function stopStreamUI() {
+          isStreaming = false;
+          document.getElementById('streamStatus').innerText = "Stopped 🔴";
+          const btn = document.getElementById('toggleBtn');
+          btn.innerText = "▶ START AUDIO";
+          btn.className = "btn btn-start";
         }
 
         function playPCM(arrayBuffer) {
@@ -146,8 +216,6 @@ app.get('/', (req, res) => {
           source.connect(audioCtx.destination);
 
           let currentTime = audioCtx.currentTime;
-          
-          // LATENCY FIX: Drop old queue if delay exceeds 0.25 seconds
           if (nextTime < currentTime || (nextTime - currentTime) > 0.25) {
             nextTime = currentTime;
           }
